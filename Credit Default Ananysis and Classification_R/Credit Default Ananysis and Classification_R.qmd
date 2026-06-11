@@ -1,0 +1,1084 @@
+---
+title: "A Cold Goodbye: The Strategic Calculation of Mortgage Default"
+author: "Byunghyun_Hwang 48764388"
+format: 
+  pdf:
+    prefer-html: true
+    latex-engine: xelatex
+execute:
+  warning: false    
+  message: false  
+editor: visual
+---
+
+## 1. Introduction
+
+Life is a continuous cycle of meetings and farewells. While every new beginning is beautiful, not all goodbyes share that same grace. In the world of finance, a mortgage represents the start of a beautiful relationship between a homeowner and their dream. Banks lend the necessary capital to foster these new beginnings, and most borrowers strive to honor that commitment. However, sometimes life forces a "cold goodbye" - a default. The tragedy, however, is rarely private. Defaults can cause a chain reaction that shakes the entire economy. When banks lend to thousands of homeowners, they may face liquidity constraints. This is where Fannie Mae steps in. As a cornerstone of the U.S. housing market, Fannie Mae provides liquidity by purchasing mortgage contracts from banks, refilling their vaults so they can continue lending to the next family. However, Fannie Mae's capital reserves are not bottomless. Their stability depends on a steady stream of interest payments from homeowners. When a 'cold goodbye' occurs, the borrower loses their home and Fannie Mae suffers financial loss. If the damage multiplies, the entire U.S. mortgage market could face a crisis as severe as the Great Depression. Therefore, for institutions like Fannie Mae, identifying who might choose a 'cold goodbye' is a necessity for survival. This analysis dives into the severity of potential losses caused by defaults and uncovers the factors of high-risk borrowers. Furthermore, it explores a phenomenon called "strategic default," where borrowers choose to walk away not out of desperation, but as a calculated and cold-blooded business decision.
+
+## 2. The Analysis
+
+This analysis aims to explore the complex dynamics of mortgage defaults and pinpoint the specific cases of 'strategic default.' Beyond identifying the severe financial impact of these defaults, this study specifically investigates strategic defaulters those who do not just fail to pay, but calculatedly leverage the system for financial gain. A massive dataset of 30-year fixed-rate mortgages from Fannie Mae, comprising 420,436 borrower records originally described by 75 different factors, was analyzed. However, real-world data is rarely beautiful. As expected, 38 of these factors were more than half empty and were subsequently removed to ensure a focused analysis. For factors with only minor amount of missing data, median values were imputed rather than averages to avoid the "trap of the average", ensuring that extreme values did not distort profiles of borrowers. This analysis categorized borrowers into two distinct groups, the "Defaulters" (1,656 records) and the "Non-Defaulters" (416,752 records). The Defaulters are defined by serious distress including 3-to-9-month delinquencies or terminal outcomes like Foreclosures, Short Sales, and Third-Party Sales. Conversely, the Non-Defaulters represent those who successfully honored their commitments, whether through consistent Current payments or early Prepaid closures. From this vast sea of information, nine factors were carefully selected, each passing rigorous tests for statistical significance and internal independence, and utilized for independent exploratory analysis. While these nine, including credit score, showed a clear relationship with default, further refinement was conducted to ensure the accuracy of the predictive models. Property value was excluded due to its lingering overlap with Combined Loan-to-Value (CLTV) to ensure the models would not double-count the same risk signal. Predictive models, much like humans, often tend to take the path of least resistance to avoid being 'wrong.' If trained on the original data with the massive numerical gap between these two groups, models might simply predict non-default for every case to achieve high accuracy. To prevent this bias, the group of Non-Defaulters underwent a "data diet", strategically sampled down to 30,000 records. This adjustment ensured a "fair fight", enabling the models to learn the subtle patterns of default without being overwhelmed by the majority, while still maintaining a sample size large enough to represent the entire population.
+
+library(SHAPforxgboost)
+
+```{r}
+#| label: Import library
+#| include: false
+
+library(tidyverse)
+library(scales)
+library(patchwork)
+library(tidymodels)
+library(xgboost)
+# install.packages("probably")
+library(probably)
+# install.packages("themis")
+library(themis)
+library(knitr)
+library(kableExtra)
+library(vip)
+library(conflicted)
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+```
+
+```{r}
+#| label: Read data
+#| include: false
+
+data <- read.csv('fannie_mae.csv')
+dim(data)
+```
+
+```{r}
+#| label: Classify groups
+#| include: false
+
+filtered_data <- data |>
+  dplyr::filter(LAST_STAT %in% c("C", "P", "S", "F", "T", "3", "4", 
+                                 "5", "6", "7", "8", "9")) |>
+  
+  # Create two groups: Defaulters and Non-Defaulters
+  mutate(target = case_when(
+    LAST_STAT %in% c("C", "P") ~ "Non-Defaulters",
+    LAST_STAT %in% c("S", "F", "T", "3", "4", "5", "6", "7", "8", "9") ~ "Defaulters"
+  )) |>
+  
+  mutate(target = factor(target, levels = c("Defaulters", "Non-Defaulters")))
+
+print(dim(filtered_data))
+print(table(filtered_data$target))
+```
+
+```{r}
+#| label: Analyze missing data
+#| include: false
+
+# Analyze proportions of invalid data for each feature
+na_summary_total <- filtered_data |>
+  summarise(across(everything(), ~ sum(is.na(.)))) |>
+  tidyr::pivot_longer(everything(), names_to = "variable", 
+                      values_to = "na_count") |>
+  mutate(na_proportion = (na_count / nrow(filtered_data)) * 100) |>
+  arrange(desc(na_count))
+
+print(na_summary_total, n = 100)
+```
+
+```{r}
+#| label: Remove features with over 50% missing data
+#| include: false
+
+# Set threshold to 50% based on the missing data analysis (previous code) 
+na_threshold <- 50  
+
+cols_to_remove <- filtered_data |>
+  summarise(across(everything(), ~ sum(is.na(.)) / n() * 100)) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "na_pro") |>
+  filter(na_pro >= na_threshold) |>
+  pull(variable)
+
+# Create a new subset without removed features
+if (length(cols_to_remove) > 0) {
+  clean_data <- filtered_data |>
+    dplyr::select(-dplyr::any_of(cols_to_remove))
+} else {
+  clean_data <- filtered_data
+}
+
+cat("Number of removed features:", length(cols_to_remove), "\n")
+cat("List of removed features:", paste(cols_to_remove, collapse = ", "), "\n")
+cat("Number of current features:", ncol(clean_data), "\n")
+```
+
+```{r}
+#| label: Verify normal distribution
+#| include: false
+
+# Conduct Shapiro test to verify normal distribution of numeric features 
+shapiro_results <- clean_data |>
+  select(where(is.numeric)) |>
+  # Prevent Shapiro test error due to zero variance features
+  select(where(~ var(., na.rm = TRUE) > 0)) |>
+  map_df(function(x) {
+    clean_x <- na.omit(x)
+    # Shapiro test can handle maximum 5,000 samples
+    sampled_x <- sample(clean_x, min(length(clean_x), 5000))
+    
+    if(length(unique(sampled_x)) < 2) {
+      return(tibble(p.value = NA_character_))
+    }
+    res <- shapiro.test(sampled_x)
+    tidy(res)
+  }, .id = "feature") |>
+  filter(!is.na(p.value)) |> 
+  mutate(p.value = as.numeric(p.value)) |>
+  select(feature, p.value) |>
+  mutate(is_normal = ifelse(p.value > 0.05, "Yes", "No")) |>
+  arrange(p.value)
+
+print(shapiro_results)
+```
+
+```{r}
+#| label: Impute median values
+#| include: false
+
+# All features do not follow normal distribution
+# Impute the missing data of the four features with their median values
+# The features have missing data less than 4% (based on the missing data analysis) 
+final_subset <- clean_data |>
+  mutate(across(c(LAST_UPB, CSCORE_B, CSCORE_MN, dti), 
+                ~ ifelse(is.na(.), median(., na.rm = TRUE), .)))
+
+# Check missing data of those four features
+final_subset |>
+  select(LAST_UPB, CSCORE_B, CSCORE_MN, dti) |>
+  summarise(across(everything(), ~ sum(is.na(.))))
+```
+
+```{r}
+#| label: Check missing data of the final subset
+#| include: false
+
+na_summary_total <- final_subset |>
+  summarise(across(everything(), ~ sum(is.na(.)))) |>
+  tidyr::pivot_longer(everything(), names_to = "variable", 
+                      values_to = "na_count") |>
+  mutate(na_percentage = (na_count / nrow(filtered_data)) * 100) |>
+  arrange(desc(na_count))
+
+print(na_summary_total, n = 100)
+```
+
+## 3. Key Findings
+
+### 3.1. The Price of the Promise: Exposure at Default (EAD)
+
+```{r}
+#| label: Quantify risk severity
+#| include: false
+
+# Compute average last unpaid balance for defaulters and non-defaulters
+comparison_summary <- final_subset |>
+  group_by(target) |>
+  summarise(avg_last_upb = mean(LAST_UPB, na.rm = TRUE))
+
+# Compute average annual profit from a single non-defaulter 
+# (Based on 2% annual NIM to illustrate the immediate severity of a single loss)
+avg_upb_non_def <- comparison_summary |> 
+  filter(target == "Non-Defaulters") |> 
+  pull(avg_last_upb)
+
+profit_margin <- 0.02
+avg_profit_per_full_payoff <- avg_upb_non_def * profit_margin
+
+# Compute average potential loss exposure (EAD) from a single defaulter
+# (This represents the total principal at risk upon default)
+avg_potential_loss_def <- comparison_summary |> 
+  filter(target == "Defaulters") |> 
+  pull(avg_last_upb)
+
+# Compute offset proportion
+offset_ratio <- ceiling(avg_potential_loss_def / avg_profit_per_full_payoff)
+
+cat("Avg. annual profit from a non-defaulter (2% NIM): $", 
+    format(round(avg_profit_per_full_payoff, 2), big.mark=","), "\n")
+cat("Avg. total loss exposure from a single defaulter (EAD): $", 
+    format(round(avg_potential_loss_def, 2), big.mark=","), "\n")
+cat("------------------------------------------------------", "\n")
+cat("It takes the annual profit of", offset_ratio, 
+    "performing borrowers\nto offset the total potential loss from just ONE defaulter.\n")
+```
+
+```{r}
+#| label: Visualize risk severity
+#| echo: false
+#| fig-width: 5.5
+#| fig-height: 2.3
+#| fig-align: center
+
+# Create a datafame usign the previous result (mean)
+ins_data_frame <- data.frame(
+  Type = c("Annual Profit\n(1 Non-Defaulter)", "Exposure at Default (EAD)\n(1 Defaulter)"),
+  Amount = c(avg_profit_per_full_payoff, avg_potential_loss_def),
+  Color = c("Profit", "Loss")
+)
+
+# Draw a bar plot
+ggplot(ins_data_frame, aes(x = reorder(Type, Amount), y = Amount, 
+                           fill = Color)) +
+  geom_bar(stat = "identity", width = 0.6) +
+  coord_flip() +
+  geom_text(aes(label = paste0("$", format(round(Amount, 0), big.mark=","))), 
+            hjust = -0.1, fontface = "bold", size = 3) +
+  scale_fill_manual(values = c("Profit" = "#FFE7BA", "Loss" = "#D95F02")) +
+  scale_y_continuous(labels = scales::comma, 
+                     expand = expansion(mult = c(0, 0.2))) + 
+  labs(
+    title = "Annual Profit vs. Exposure at Default (EAD)",
+    x = "", 
+    y = "Amount ($)"
+  ) +
+  theme_minimal() +
+  theme(
+legend.position = "none",
+    plot.title.position = "plot", 
+    plot.title = element_text(face = "bold", size = 10, hjust = 0.5),
+    axis.text.y = element_text(size = 8, face = "bold", color = "black"),
+    axis.text.x = element_text(size = 7), 
+    panel.grid.major.y = element_blank(),
+    plot.margin = unit(c(0.2, 0.2, 0.2, 0.2), "cm")
+  )
+```
+
+While defaulters represent a mere approximately 0.4% (1,656 individuals) of the 416,752 active borrowers, the price of each broken promise is highly significant for Fannie Mae. Conventional analysis often focuses on realized net losses. However, such data is frequently sparse and fails to capture the full scale of immediate risk. To ensure a more robust risk assessment, Exposure at Default (EAD), measured by "Last Unpaid Balance" is utilized as a critical metric. In this analysis, average values were deliberately chosen to capture the full economic gravity of defaults, accounting for high-impact losses. EAD represents the actual dollar amount at risk when a borrower stops paying. Assuming a 2% annual Net Interest Margin (NIM), the average annual profit generated from a performing borrower is approximately \$3,854 USD. In contrast, the average potential loss exposure from a single defaulter reaches approximately \$183,457 USD. In other words, this implies that the combined annual profit from at least 48 performing borrowers is required to offset the total principal loss from just a single defaulter. While the frequency of default is low, its high severity necessitates a proactive risk mitigation mechanism to identify these high-risk individuals and proactively manage potential credit exposure before losses are realized. Since overlooking even a small fraction of defaulters poses a significant financial risk to Fannie Mae, establishing robust filtering criteria is critical. Following this impact assessment, an independent analysis is conducted to examine the key factors that are statistically significant to default.
+
+```{r}
+#| label: Conduct Wilcoxon test to verify feature influence
+#| fig-align: center
+#| fig-height: 3
+#| fig-width: 5
+#| include: false
+
+# Since the 19 numeric features do not follow normal distributions,
+# conduct Wilcoxon test to identify their influence to target 
+wilcox_test_results <- final_subset |>
+  select(target, where(is.numeric)) |>
+  pivot_longer(cols = -target, names_to = "feature", values_to = "value") |>
+  group_by(feature) |>
+  filter(!is.na(value)) |>
+  filter(length(unique(value[target == "Defaulters"])) > 1 | 
+         length(unique(value[target == "Non-Defaulters"])) > 1) |>
+  do({
+    res <- tryCatch(
+      tidy(wilcox.test(value ~ target, data = .)),
+      error = function(e) return(tibble(p.value = NA_real_))
+    )
+    res
+  }) |>
+  filter(!is.na(p.value)) |>
+  select(feature, p.value) |>
+  mutate(significant_wilcox = ifelse(p.value < 0.05, "Yes", "No")) |>
+  arrange(p.value)
+
+print(wilcox_test_results)
+```
+
+```{r}
+#| label: Select top 10 significant features
+#| fig-align: center
+#| fig-height: 3
+#| fig-width: 5
+#| include: false
+
+# Select only statisitically significant features
+sig_features <- wilcox_test_results |>
+  filter(significant_wilcox == "Yes") |>
+  pull(feature)
+
+# Compute correlation matrix
+cor_matrix <- final_subset |>
+  select(all_of(sig_features)) |>
+  na.omit() |>
+  cor()
+
+# Isolate unique variable relationships
+cor_matrix[upper.tri(cor_matrix, diag = TRUE)] <- 0
+
+# Remove highly correlated features (multicollinearity)
+high_cor_features <- which(abs(cor_matrix) > 0.8, arr.ind = TRUE)
+features_to_remove <- c()
+
+if (nrow(high_cor_features) > 0) {
+  for (i in 1:nrow(high_cor_features)) {
+    f1 <- colnames(cor_matrix)[high_cor_features[i, 1]]
+    f2 <- colnames(cor_matrix)[high_cor_features[i, 2]]
+    
+    # Between highly correlated pairs,
+    # remove the feature with the higher p-value
+    p1 <- wilcox_test_results$p.value[wilcox_test_results$feature == f1]
+    p2 <- wilcox_test_results$p.value[wilcox_test_results$feature == f2]
+    
+    remove_target <- ifelse(p1 > p2, f1, f2)
+    features_to_remove <- c(features_to_remove, remove_target)
+  }
+}
+
+# Select top 10 significant features
+final_top_10_features <- wilcox_test_results |>
+  filter(significant_wilcox == "Yes") |>
+  filter(!(feature %in% unique(features_to_remove))) |>
+  arrange(p.value) |>
+  head(10) |>
+  pull(feature)
+
+print(final_top_10_features)
+```
+
+### 3.2. Credit Score: The Anchor of Financial Reliability
+
+```{r}
+#| label: Visualize and compare credit score
+#| echo: false
+#| fig-width: 5
+#| fig-height: 2.3
+#| fig-align: center
+
+# Compute statistics of credit score
+credit_stats <- final_subset |>
+  group_by(target) |>
+  summarise(
+    mean_score = mean(CSCORE_B, na.rm = TRUE),
+    median_score = median(CSCORE_B, na.rm = TRUE),
+    n = n()
+  )
+
+# Draw a violin plot
+ggplot(final_subset, aes(x = target, y = CSCORE_B, fill = target)) +
+  geom_violin(alpha = 0.4, color = NA, width = 0.6) + 
+  geom_boxplot(width = 0.12, color = "#444444", alpha = 0.8, 
+               outlier.color = "gray80", outlier.size = 1) +
+  scale_fill_manual(values = c("Defaulters" = "#FFE7BA", 
+                               "Non-Defaulters" = "#D95F02")) +
+  labs(
+    title = "Credit Score Comparison",
+    x = NULL, 
+    y = "FICO Score (Credit Score)"
+  ) +
+  theme_minimal(base_family = "sans") +
+  theme(
+    legend.position = "none",
+    panel.grid.major.x = element_blank(), 
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold", size = 11, hjust = 0.5, 
+                              margin = margin(b = 10), color = "#2c3e50"),
+    plot.subtitle = element_text(size = 10, hjust = 0.5, color = "gray30", 
+                                 margin = margin(b = 25)),
+    axis.title.y = element_text(size = 9, face = "bold", margin = margin(r = 5)), 
+    axis.text.y = element_text(size = 8, color = "#444444"),
+    axis.text.x = element_text(size = 10, face = "bold", color = "#2c3e50"),
+    plot.margin = margin(t = 5, r = 10, b = 5, l = 5)
+  )
+```
+
+Do you believe a high credit score guarantees a 'safe' borrower? For decades, the Classic FICO Score has been the industry standard for assessing borrower reliability. However, as shown in the distribution density, while performing borrowers generally maintain higher credit scores, a substantial number of defaulters also possess high credit scores exceeding the 700 mark. This visible overlap confirms that credit scores should serve as a guiding reference, not the only answer. To truly mitigate capital erosion, it is vital to augment credit scores with a multi-dimensional perspective. Integrating additional statistically significant features enables a deep understanding of complex borrower behaviors and hidden risk patterns.
+
+### 3.3. Structural Context: Loan Modifications and Household Composition
+
+```{r}
+#| label: Compare loan modification and number of borrowers
+#| echo: false
+#| fig-width: 6.5
+#| fig-height: 2.3
+#| fig-align: center
+
+mod_plot_data <- final_subset |>
+  count(target, MOD_FLAG) |>
+  group_by(target) |>
+  mutate(pct = n / sum(n))
+
+bo_plot_data <- final_subset |>
+  count(target, num_bo) |>
+  group_by(target) |>
+  mutate(pct = n / sum(n)) 
+
+# Draw bar plots
+p1 <- ggplot(mod_plot_data, aes(x = target, y = pct, fill = as.factor(MOD_FLAG))) +
+  geom_bar(stat = "identity", position = "fill", width = 0.6) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) + 
+  scale_fill_brewer(palette = "Oranges", name = "Modified", na.value = "grey70") +
+  labs(
+    title = "Loan Modification",
+    x = NULL,
+    y = "Percentage"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 11),
+    plot.subtitle = element_text(hjust = 0.5, size = 10, color = "gray30"),
+    axis.title.y = element_text(margin = margin(r = 15)),
+    legend.position = "right",
+    legend.title = element_text(size = 9, face = "bold"), 
+    legend.text = element_text(size = 8),                
+    legend.key.size = unit(0.4, "cm"),                    
+    legend.spacing.y = unit(0.1, "cm")
+  )
+
+p2 <- ggplot(bo_plot_data, aes(x = target, y = pct, fill = as.factor(num_bo))) +
+  geom_bar(stat = "identity", position = "fill", width = 0.6) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_fill_brewer(palette = "Oranges", name = "No.Borrowers") +
+  labs(
+    title = "Number of Borrowers",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 11),
+    axis.text.y = element_blank(),
+    axis.text.x = element_text(size = 8),
+    legend.title = element_text(size = 8, face = "bold"),
+    legend.text = element_text(size = 7),
+    panel.grid.major.x = element_blank(),
+    plot.margin = margin(t = 5, r = 5, b = 5, l = 5)
+  )
+
+(p1 + p2) + 
+  plot_layout(guides = "collect") & 
+  theme(
+    legend.position = "right",
+    legend.key.size = unit(0.3, "cm"),
+    legend.spacing.y = unit(0.05, "cm")
+  )
+```
+
+Looking at the left bar plot, a significantly higher prevalence of loan modifications is observed within the defaulter group compared to the non-default group. This disparity suggests that a modification event may serve as an early-warning signal preceding the final decision to default which is a precursor to initial financial stress before the actual default occurs. On the right, the plot shows that single-borrower loans account for approximately 75% of all default cases, a figure significantly higher than the 50% observed among the non-defaulters. This disparity suggests that joint-obligation structures may provide a vital financial buffer, likely due to a diversified income and the advantage of collaborative financial management. By sharing the repayment burden and decision-making, multiple-borrower loans may substantially reduce risk of default, offering greater resilience against financial stress.
+
+### 3.4. Loan Fundamentals: Combined Loan-to-Value and Interest Rates
+
+```{r}
+#| label: Compare original combined original loan-to-value and original interest rates
+#| echo: false
+#| fig-width: 6.5
+#| fig-height: 2.3 
+#| fig-align: center
+
+orange_palette <- c("Defaulters" = "#D9730D", "Non-Defaulters" = "#FFE7BA")
+ocltv_plot_data <- final_subset[, c("target", "ocltv")]
+rt_plot_data <- final_subset[, c("target", "orig_rt")]
+
+# Draw box plots
+p1 <- ggplot(ocltv_plot_data, aes(x = target, y = ocltv, fill = target)) +
+  geom_boxplot(outlier.alpha = 0.2, width = 0.5, color = "#444444") +
+  scale_fill_manual(values = orange_palette) +
+  scale_y_continuous(labels = function(x) paste0(x, "%")) + 
+  labs(
+    title = "Combined Loan-to-Value",
+    x = NULL,
+    y = "CLTV (%)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 11),
+    axis.title.y = element_text(margin = margin(r = 15)),
+    legend.position = "none"
+  )
+
+p2 <- ggplot(rt_plot_data, aes(x = target, y = orig_rt, fill = target)) +
+  geom_boxplot(outlier.alpha = 0.2, width = 0.5, color = "#444444") +
+  scale_fill_manual(values = orange_palette) +
+  scale_y_continuous(labels = function(x) paste0(x, "%")) + 
+  labs(
+    title = "Interest Rates",
+    x = NULL,
+    y = "Interest Rate (%)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 11),
+    plot.subtitle = element_text(hjust = 0.5, size = 10, color = "gray30"),
+    axis.title.y = element_text(margin = margin(r = 15)),
+    legend.position = "none"
+  )
+
+(p1 + p2) & 
+  theme(
+    axis.title.y = element_text(size = 9, face = "bold", color = "#2c3e50"),
+    axis.text = element_text(size = 8)
+  )
+```
+
+Looking at the left box plot, defaulters exhibit significantly higher leverage compared to non-defaulters. The typical borrower in the defaulter group carries a Combined Loan-to-Value (CLTV) ratio concentrated between approximately 75% and 95%, whereas the non-defaulters stay within a lower, broader range of approximately 67% and 87%. This upward shift in the core distribution indicates that diminished home equity may be a critical driver of default risk, making borrowers highly vulnerable to market fluctuations. On the right, the plot shows the interest rates for the majority of defaulters are notably higher. This disparity suggests that a heavier interest burden may be a significant driver of credit risk. Higher rates not only reduce a borrower's financial flexibility but also increase the total cost of debt, leading to an increased likelihood of default.
+
+### 3.5. The Size of the Promise: Property Value and Loan Amount
+
+```{r}
+#| label: Compare original property value & original loan amount
+#| echo: false
+#| fig-width: 6.5
+#| fig-height: 2.6
+#| fig-align: center
+
+val_plot_data <- final_subset[, c("target", "ORIG_VAL")]
+val_plot_data$ORIG_VAL_M <- val_plot_data$ORIG_VAL / 1e6
+amt_plot_data <- final_subset[, c("target", "orig_amt")]
+
+# Draw box plots
+p1 <- ggplot(val_plot_data, aes(x = target, y = ORIG_VAL_M, fill = target)) +
+  geom_boxplot(outlier.alpha = 0.2, width = 0.5, color = "#444444") +
+  scale_fill_manual(values = orange_palette) +
+  scale_y_continuous(labels = scales::dollar_format(suffix = "M")) + 
+  labs(
+    title = "Property Value",
+    x = NULL,
+    y = "Value ($M)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 10),
+    plot.subtitle = element_text(hjust = 0.5, size = 9, color = "gray30"),
+    axis.title.y = element_text(margin = margin(r = 15)),
+    legend.position = "none"
+  )
+
+p2 <- ggplot(amt_plot_data, aes(x = target, y = orig_amt, fill = target)) +
+  geom_boxplot(outlier.alpha = 0.2, width = 0.5, color = "#444444") +
+  scale_fill_manual(values = orange_palette) +
+  scale_y_continuous(labels = scales::label_dollar(scale = 1e-3, suffix = "K")) + 
+  labs(title = "Loan Amount", x = NULL, y = "Amount ($K)") + 
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 10),
+    axis.title.y = element_text(size = 9, margin = margin(r = 5)),
+    axis.text = element_text(size = 8),
+    panel.grid.major.x = element_blank(),
+    legend.position = "none",
+    plot.margin = margin(t = 5, r = 5, b = 5, l = 10)
+  )
+
+(p1 + p2) & 
+  theme(
+    axis.title.y = element_text(size = 9, face = "bold", color = "#2c3e50"),
+    axis.text = element_text(size = 8)
+  )
+```
+
+A compelling paradox was identified in this analysis: larger promises may prove to be more resilient. Typically, non-defaulters purchase higher-valued properties and secure larger loan amounts compared to defaulters. Remarkably, no default cases were observed for properties valued over \$2 million, suggesting that high-value assets may serve as natural risk-filtering mechanism for identifying high-stability portfolios. Similarly, contrary to common belief, a larger loan amount may not inherently increase default risk. The core distribution of data shows that the density of default cases thins out significantly for loans exceeding approximately \$600,000, with zero defaults identified for loans above \$1,000,000. These findings challenge the conventional assumption that larger debts entail higher risk. Instead, they indicate that borrower capacity and asset quality may be far more critical than the absolute size of debt.
+
+### 3.6. Time and Tension: Loan Term & Debt-to-Income Ratio
+
+```{r}
+#| label: Compare original loan term & debt-to-income ratio
+#| echo: false
+#| fig-width: 6.5
+#| fig-height: 2.3
+#| fig-align: center
+
+trm_plot_data <- final_subset[, c("target", "orig_trm")]
+dti_plot_data <- final_subset[, c("target", "dti")]
+
+# Draw box plots
+p1 <- ggplot(trm_plot_data, aes(x = target, y = orig_trm, fill = target)) +
+  geom_boxplot(outlier.alpha = 0.2, width = 0.5, color = "#444444") +
+  scale_fill_manual(values = orange_palette) +
+  scale_y_continuous(breaks = seq(0, 480, by = 120), 
+                     labels = function(x) paste0(x, "m")) + 
+  labs(
+    title = "Loan Term",
+    x = NULL,
+    y = "Loan Term (Months)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 11),
+    plot.subtitle = element_text(hjust = 0.5, size = 10, color = "gray30"),
+    axis.title.y = element_text(margin = margin(r = 15)),
+    legend.position = "none"
+  )
+
+p2 <- ggplot(dti_plot_data, aes(x = target, y = dti, fill = target)) +
+  geom_boxplot(outlier.alpha = 0.2, width = 0.5, color = "#444444") +
+  scale_fill_manual(values = orange_palette) +
+  scale_y_continuous(labels = function(x) paste0(x, "%")) + 
+  labs(
+    title = "Debt-to-Income Ratio",
+    x = NULL,
+    y = "DTI Ratio (%)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 11),
+    plot.subtitle = element_text(hjust = 0.5, size = 10, color = "gray30"),
+    axis.title.y = element_text(margin = margin(r = 15)),
+    legend.position = "none"
+  )
+
+(p1 + p2) & 
+  theme(
+    axis.title.y = element_text(size = 9, face = "bold", color = "#2c3e50"),
+    axis.text = element_text(size = 8)
+  )
+```
+
+The loan term may play a pivotal role in the temporal exposure of credit risk. The vast majority of default cases are concentrated around the 360-month mark, the standard for the U.S. mortgage market. In contrast, non-defaulters exhibit a broader distribution, including shorter-term loans. This suggests that extended loan terms may heighten default risk by increasing a borrower's vulnerability to long-term economic fluctuations and unforeseen financial events. Regarding the Debt-to-Income (DTI) ratio, the typical borrower among non-defaulters maintains a lower DTI compared to defaulters. However, certain default cases occur even at lower ratios (between 5% - 20%). These instances are likely attributable to unforeseen income shocks, such as sudden unemployment, or to strategic defaults triggered by high Combined Loan-to-Value (CLTV) rather than immediate cash flow issues. This suggests that while a favorable DTI at origination may be a strong defensive signal, it is not an absolute guarantee against default, as financial stability can be abruptly compromised by unexpected economic headwinds.
+
+### 3.7. Beyond Intuition: Predictors of Cold Goodbyes
+
+```{r}
+#| label: Prepare for XGBoost model development
+#| include: false
+
+# 1. Downsampling & Data Preparation 
+# Keep all defaulters 
+# Apply downsampling to address class imbalance. 
+# Based on the Law of Large Numbers (LLN), a sample size of 30,000 is 
+# statistically sufficient to represent the majority class distribution.
+cat(">>> Step 1: Preparing data and applying Downsampling...\n")
+set.seed(48764388)
+defaulters <- final_subset |> filter(target == "Defaulters")
+non_defaulters_sample <- final_subset |> 
+  filter(target == "Non-Defaulters") |> 
+  sample_n(30000)
+
+fast_df <- bind_rows(defaulters, non_defaulters_sample) |>
+  slice(sample(1:n())) |> 
+  mutate(target = factor(target, levels = c("Defaulters", "Non-Defaulters")))
+
+# 2. Separate data 
+cat(">>> Step 2: Splitting data (80% Train / 20% Test)...\n")
+set.seed(48764388)
+data_split <- initial_split(fast_df, prop = 0.8, strata = target)
+train_data <- training(data_split)
+test_data  <- testing(data_split)
+
+# 3. Define a recipe
+cat(">>> Step 3: Defining recipe and preprocessing steps...\n")
+
+input_features <- c("MOD_FLAG", "CSCORE_B", "orig_rt", "ocltv", 
+                    "num_bo", "dti", "orig_amt", "orig_trm")
+
+xgb_recipe <- recipe(target ~ ., 
+                     data = train_data[c("target", input_features)]) |>
+  step_log(orig_amt, offset = 1) |>  
+  step_mutate(
+    across(c(MOD_FLAG, num_bo), as.factor)
+  ) |>
+  step_novel(all_nominal_predictors()) |> 
+  step_dummy(all_nominal_predictors()) |>
+  step_zv(all_predictors()) |> 
+  step_normalize(all_numeric_predictors())
+```
+
+```{r}
+#| label: Develop a XGBoost Classification Model
+#| include: false
+
+# --- [Model Training] ---
+
+# Generate a RDS file
+# TRUE: Train the model, FALSE: Load existing model
+run_modeling <- TRUE
+model_path <- "final_xgb_fit.rds"
+
+if (run_modeling) {
+  cat(">>> [MODE: NEW TRAINING] ...\n")
+
+  # 1. Define model specifications 
+  cat(">>> Step 4: Setting XGBoost model specification...\n")
+  xgb_spec <- boost_tree(
+    trees = 1000,
+    tree_depth = tune(),
+    min_n = tune(),
+    loss_reduction = tune(),
+    sample_size = tune(),
+    mtry = tune(),
+    learn_rate = tune()
+  ) |>
+    set_engine("xgboost", verbose = 1) |>
+    set_mode("classification")
+
+  # 2. Define workflow
+  xgb_workflow <- workflow() |>
+    add_recipe(xgb_recipe) |>
+    add_model(xgb_spec)
+
+  # 3. Setup hyperparameter tuning
+  cat(">>> Step 6: Starting Hyperparameter Tuning (Grid=10, 5-fold CV)...\n")
+  set.seed(48764388)
+  xgb_res <- tune_grid(
+    xgb_workflow,
+    resamples = vfold_cv(train_data, v = 5, strata = target), 
+    grid = 10, 
+    metrics = metric_set(roc_auc, pr_auc),
+    control = control_grid(verbose = TRUE, allow_par = FALSE)
+  )
+
+  # 4. Train and fit model
+  cat(">>> Step 7: Finalizing the model with the best parameters...\n")
+  best_xgb <- xgb_res |> select_best(metric = "roc_auc")
+  final_xgb_wf <- xgb_workflow |> finalize_workflow(best_xgb)
+  
+  cat(">>> Step 8: Conducting Last Fit on the entire split...\n")
+  final_xgb_fit <- final_xgb_wf |> last_fit(data_split)
+
+  # 5. Save the model 
+  saveRDS(final_xgb_fit, model_path)
+  cat(">>> SUCCESS: Model is saved to", model_path, "!\n")
+
+} else {
+  if (file.exists(model_path)) {
+    cat(">>> [MODE: LOAD RDS] Loading existing model...\n")
+    final_xgb_fit <- readRDS(model_path)
+  } else {
+    stop(">>> [ERROR] Model file not found.")
+  }
+}
+```
+
+```{r}
+#| label: Prepare for Logistic Regression model development
+#| include: false
+
+# 1. Downsampling & Data Preparation 
+# Keep all defaulters 
+# Apply downsampling to address class imbalance. 
+# Based on the Law of Large Numbers (LLN), a sample size of 30,000 is 
+# statistically sufficient to represent the majority class distribution. 
+cat(">>> Step 1: Preparing data and applying Downsampling...\n")
+set.seed(48764388)
+defaulters <- final_subset |> filter(target == "Defaulters")
+non_defaulters_sample <- final_subset |> 
+  filter(target == "Non-Defaulters") |> 
+  sample_n(30000)
+
+fast_df <- bind_rows(defaulters, non_defaulters_sample) |>
+  slice(sample(1:n())) |> 
+  mutate(target = factor(target, levels = c("Defaulters", "Non-Defaulters")))
+
+# 2. Separate data 
+cat(">>> Step 2: Splitting data (80% Train / 20% Test)...\n")
+set.seed(48764388)
+data_split <- initial_split(fast_df, prop = 0.8, strata = target)
+train_data <- training(data_split)
+test_data  <- testing(data_split)
+
+# 3. Define a recipe
+cat(">>> Step 3: Defining recipe and preprocessing steps...\n")
+
+input_features <- c("MOD_FLAG", "CSCORE_B", "orig_rt", "ocltv", 
+                    "num_bo", "dti", "orig_amt", "orig_trm")
+
+log_recipe <- recipe(target ~ ., data = train_data[c("target", input_features)]) |>
+  step_log(orig_amt, offset = 1) |>  
+  step_mutate(
+    across(c(MOD_FLAG, num_bo), as.factor)
+  ) |>
+  step_novel(all_nominal_predictors()) |> 
+  step_dummy(all_nominal_predictors()) |>
+  step_zv(all_predictors()) |> 
+  step_normalize(all_numeric_predictors())
+```
+
+```{r}
+#| label: Develop a Logistic Regression model
+#| include: false
+
+# 1. Define model specifications 
+log_spec <- logistic_reg() |> 
+  set_engine("glm") |> 
+  set_mode("classification")
+
+# 2. Define workflow
+log_workflow <- workflow() |> 
+  add_recipe(log_recipe) |> 
+  add_model(log_spec)
+
+# 3. Train and fit model
+cat(">>> Training Logistic Regression Model...\n")
+log_fit <- log_workflow |> 
+  last_fit(data_split)
+
+# 4. Print outcomes 
+cat(">>> Logistic Regression Performance Metrics:\n")
+log_results <- collect_metrics(log_fit)
+print(log_results) 
+```
+
+```{r}
+#| label: Display model classification performance
+#| echo: false
+#| fig-width: 6
+#| fig-height: 2.8 
+#| fig-align: center
+
+xgb_predictions <- collect_predictions(final_xgb_fit)
+xgb_cm <- xgb_predictions |> conf_mat(truth = target, estimate = .pred_class)
+
+log_predictions <- collect_predictions(log_fit)
+log_cm <- log_predictions |> conf_mat(truth = target, estimate = .pred_class)
+
+# Plot XGBoost performance matrix 
+p1 <- autoplot(xgb_cm, type = "heatmap") +
+  scale_fill_gradient(low = "#fff5f0", high = "#e67e22") + 
+  labs(
+    title = "XGBoost",
+    subtitle = paste0("AUC: ", round(collect_metrics(final_xgb_fit) |> 
+                                     filter(.metric == "roc_auc") |> 
+                                       pull(.estimate), 4))
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 10),
+    plot.subtitle = element_text(hjust = 0.5, size = 8.5, color = "gray30"),
+    axis.text = element_text(size = 8),
+    axis.title = element_text(size = 9),
+    legend.position = "none",
+    plot.margin = margin(t = 5, r = 2, b = 5, l = 5)
+  )
+
+# Plot Logistic Regression performance matrix 
+p2 <- autoplot(log_cm, type = "heatmap") +
+  scale_fill_gradient(low = "#fff5f0", high = "#e67e22") + 
+  labs(
+    title = "Logistic Regression",
+    subtitle = paste0("AUC: ", round(log_results |> filter(.metric == "roc_auc") 
+    |> pull(.estimate), 4)), y = NULL
+  ) +
+  theme_minimal() +
+  theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 10),
+      plot.subtitle = element_text(hjust = 0.5, size = 8.5, color = "gray30"),
+      axis.text.y = element_blank(), 
+      axis.text.x = element_text(size = 8),
+      axis.title.x = element_text(size = 9),
+      legend.position = "none",
+      plot.margin = margin(t = 5, r = 5, b = 5, l = 2)
+  )
+
+p1 + p2
+```
+
+Two classification models, XGBoost and Logistic Regression, were developed to predict mortgage default by capturing the holistic effects of the identified eight risk factors. While Logistic Regression provides a robust baseline for linear dependencies, XGBoost was employed to uncover potential non-linear interactions. Remarkably, as shown in the performance matrix diagrams, both models exhibited nearly identical performance. This suggests that the primary risk drivers in this dataset possess a linear relationship with the target variable (Defaulters or Non-Defaulters). Specifically, the Logistic Regression model achieved a precision of approximately 64.3% (36/56) in predicting 'cold goodbyes'. Given the marginal performance gain of XGBoost, Logistic Regression offers a compelling advantage through its superior interpretability and transparency, allowing for a clearer evaluation of the individual influence of each default driver.
+
+```{r}
+#| label: Comparison Reference - Visualize the influencing factors (XGBoost)
+#| eval: false
+#| include: false
+
+xgb_engine <- extract_fit_engine(final_xgb_fit)
+
+vip(xgb_engine, 
+    num_features = 8, 
+    geom = "col", 
+    aesthetics = list(fill = "#2c3e50")) + 
+  theme_minimal() +
+  labs(
+    title = "XGBoost Variable Importance: Key Drivers of Default",
+    x = "Predictor Variables",
+    y = "Importance Score"
+  )
+```
+
+```{r}
+#| label: Check feature coefficients (Logistic Regression model)
+#| include: false
+
+log_coefficients_or <- log_fit |> 
+  extract_fit_parsnip() |> 
+  tidy(exponentiate = TRUE) |>   
+  filter(term != "(Intercept)") |> 
+  filter(p.value < 0.05) 
+
+risk_increasers <- log_coefficients_or |> 
+  filter(estimate > 1) |>           
+  arrange(desc(estimate)) |>        
+  head(4)                           
+
+risk_decreasers <- log_coefficients_or |> 
+  filter(estimate < 1) |>           
+  arrange(estimate) |>              
+  head(4)                           
+
+cat("--- Statistically Significant Risk Increasers (Top 4) ---\n")
+print(risk_increasers)
+
+cat("\n--- Statistically Significant Risk Decreasers (Top 4) ---\n")
+print(risk_decreasers)
+```
+
+```{r}
+#| label: Visualize the influencing factors (Logistic Regression)
+#| echo: false
+#| fig-width: 6
+#| fig-height: 2 
+#| fig-align: center
+
+plot_data <- log_coefficients_or |>
+  filter(term %in% c("CSCORE_B", "num_bo_X2", "orig_amt", 
+                     "ocltv", "MOD_FLAG_X1", "orig_trm", "orig_rt")) |>
+  mutate(
+    Risk_Effect = (estimate - 1) * 100,
+    Factor = case_when(
+      # --- Risk Increasers ---
+      term == "CSCORE_B"    ~ "High Credit Score",
+      term == "num_bo_X2"   ~ "Two Borrowers",
+      term == "orig_amt"    ~ "Large Loan Size",
+    
+      # --- Risk Decreasers ---
+      term == "ocltv"       ~ "High Combined LTV",
+      term == "MOD_FLAG_X1" ~ "Loan Modification (Yes)",
+      term == "orig_trm"    ~ "Longer Loan Term",    
+      term == "orig_rt"     ~ "High Interest Rates",
+      TRUE ~ term
+    ),
+    Impact = ifelse(Risk_Effect > 0, "Increase", "Decrease")
+  )
+
+ggplot(plot_data, aes(x = reorder(Factor, Risk_Effect), y = Risk_Effect, fill = Impact)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = sprintf("%+.1f%%", Risk_Effect), 
+                hjust = ifelse(Risk_Effect > 0, -0.1, 1.1)), 
+            size = 3, fontface = "bold") +
+  geom_hline(yintercept = 0, linetype = "solid", color = "black", alpha = 0.3) +
+  scale_fill_manual(values = c("Increase" = "#e67e22", "Decrease" = "#2c3e50")) +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0.2, 0.2))) +
+  labs(
+    title = "Quantifying the Impact on Default Risk Likelihood",
+    x = NULL, y = "Effect on Risk Likelihood (%)"
+  ) +
+  theme_minimal(base_size = 9) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, size = 8, color = "gray30"),
+    panel.grid.minor = element_blank(),
+    axis.text.y = element_text(face = "bold", color = "gray10")
+  )
+```
+
+Based on the Logistic Regression results, the seven primary factors were identified as key drivers of default. These percentages show how each factor increases or decreases the chance of default. While some results may appear counter-intuitive compared to the initial independent factor analysis, they reveal deeper insights when controlling for other factors. Larger loan sizes and joint applications (especially Two Borrowers) significantly elevate default likelihood, reflecting a heightened sensitivity to aggregate debt levels. Interestingly, a notable increase was noted even for higher credit scores, reinforcing the idea that a credit score alone is not a foolproof shield in complex lending scenarios. Conversely, higher Combined Loan-to-Value (CLTV) is associated with a decreased likelihood of default. This suggests that borrowers holding high-value properties, even with higher leverage, may be statistically more committed to honoring their obligations, potentially reflecting High-Net-Worth individuals with substantial borrowing capacity. In this context, the emphasis on psychological data on behavioral motivation becomes significant to capture the use of 'Strategic Leverage' for 'Capital Efficiency' in future studies. Furthermore, higher interest rates and longer loan terms were paradoxically linked to lower risk, likely a result of more rigorous lender screening and effective risk-based pricing. Finally, loan modification stands as a powerful deterrent, reducing the financial burden on distressed borrowers and preventing a 'cold goodbye'.
+
+### 3.8. Strategic Default: Beyond the Ability to Pay
+
+```{r}
+#| label: Compute statistics of features to identify strategic default cases
+#| include: false
+
+# Since features do not follow normal distribution, use median
+strategic_deep_dive_alt <- final_subset |>
+  group_by(purpose, target) |>
+  summarise(
+    median_credit = median(CSCORE_MN, na.rm = TRUE),
+    median_dti = median(dti, na.rm = TRUE),
+    median_ocltv = median(ocltv, na.rm = TRUE),
+    n = n(),
+    .groups = 'drop'
+  ) 
+
+print(strategic_deep_dive_alt)
+```
+
+```{r}
+#| label: Draw a loan purpose table to identify strategic default cases
+#| echo: false
+#| message: false
+
+# Arrange and format data
+strategic_table_data_clean <- strategic_deep_dive_alt |>
+  mutate(
+    median_credit = round(median_credit, 1),
+    median_dti = paste0(round(median_dti, 1), "%"),
+    median_ocltv = paste0(round(median_ocltv, 1), "%")
+  ) |>
+  rename(
+    `Loan Purpose` = purpose,
+    `Loan Status` = target,
+    `Median Credit Score` = median_credit,
+    `Median DTI` = median_dti,
+    `Median CLTV` = median_ocltv
+  ) |>
+  select(`Loan Purpose`, `Loan Status`, `Median Credit Score`, `Median DTI`, 
+         `Median CLTV`)
+
+strategic_table_data_clean |>
+  kable(
+    align = "clrrr",
+    booktabs = TRUE,
+  ) |>
+  kable_styling(
+    latex_options = c("striped", "hold_position"),
+    position = "center",
+    full_width = FALSE,
+    font_size = 9
+  ) |>
+  row_spec(0, bold = TRUE, color = "white", background = "#333333") |>
+  row_spec(which(strategic_table_data_clean$`Loan Status` == "Defaulters"), 
+           background = "#FFF4E6") |>
+  row_spec(
+    which(strategic_table_data_clean$`Loan Purpose` == "C" & strategic_table_data_clean$`Loan Status` == "Defaulters"),
+    bold = TRUE, 
+    color = "#B25600",
+    extra_css = "border-bottom: 2px solid #B25600;"
+  )
+```
+
+Among the three loan types, Cash-Out (C) emerges as the most significant risk factor. Unlike Purchase or Rate/Term borrowers, who are primarily motivated to protect and build home equity, Cash-Out borrowers have already realized immediate liquidity by withdrawing funds, leaving them with diminished equity to defend. In essence, while the home serves as a 'financial hostage' that ensures repayment for most, the 'hostage effect' is significantly weakened for Cash-Out borrowers. Despite having a clear capacity to repay, certain borrowers choose to default when the economic incentive to maintain the mortgage vanishes. This trend is particularly evident in Cash-Out loans, where there is a clear and obvious difference between high-risk and low-risk borrowers. While non-defaulters maintain a median Debt-to-Income (DTI) of 36% and Combined Loan-to-Value (CLTV) of 70%, defaulters exhibit a higher median DTI of 39%, combined with a higher median CLTV of 75% and a moderate credit score of 688. While the numeric gap between two groups may appear modest, it may represent an 'exit trigger'. The combination of these elevated metrics strongly suggests a 'strategic walk-away' behavior. A DTI of 39% indicates a substantial monthly repayment burden (yet remains within a manageable range for debt service), reducing the borrower's financial flexibility. In this constrained state, a high CLTV of 75% functions as a 'tipping point' where the borrower's incentive to maintain equity is outweighed by the immediate economic benefit of defaulting. Consequently, they prioritize short-term financial gain over long-term credit standing. Ultimately, this behavior reflects a shift where the property is treated as a disposable financial asset rather than a primary residence, leading to moral hazard where borrowers strategically walk away from their loans to avoid further losses as property prices drop. In summary, Cash-Out borrowers who have elevated CLTV, strained DTI, and moderate credit can be categorized as strategic defaulters.
+
+```{r}
+#| label: Identify strategic defaulters out of Cash Out defaulters 
+#| echo: false
+#| message: false
+
+comparison_c_only <- final_subset |>
+  filter(purpose == "C" & target == "Defaulters") |>
+  mutate(c_sub_group = case_when(
+    (dti <= 40 & CSCORE_B >= 650 & ocltv >= 75) ~ "Strategic_Defaulters",
+    TRUE ~ "General_Defaulters"
+  ))
+
+c_comparison_table <- comparison_c_only |>
+  group_by(c_sub_group) |>
+  summarise(
+    total_n = n(),
+    mod_rate = mean(as.numeric(as.character(MOD_FLAG)), na.rm = TRUE),
+    median_cltv = median(ocltv, na.rm = TRUE),
+    median_dti = median(dti, na.rm = TRUE),
+    median_credit = median(CSCORE_B, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# Draw a comparison table for Cash Out general defaulters and strategic defaulters
+c_comparison_table |>
+  mutate(
+    total_n_label = format(total_n, big.mark = ","),
+    median_cltv_label = paste0(round(median_cltv, 1), "%"),
+    median_dti_label = paste0(round(median_dti, 1), "%"),
+    sub_group_label = gsub("_", " ", c_sub_group)
+  ) |>
+  select(
+    `Cash-Out Sub-Group` = c_sub_group,
+    `Total Count` = total_n_label,
+    `Median DTI` = median_dti_label,
+    `Median CLTV` = median_cltv_label
+  ) |>
+  kable(booktabs = TRUE, align = "lcccc") |>
+  kable_styling(latex_options = c("striped", "hold_position"), 
+                position = "center",
+                font_size = 9) |>
+  row_spec(0, bold = TRUE, color = "white", background = "#444444") |>
+  row_spec(which(c_comparison_table$c_sub_group == "Strategic_Defaulters"), 
+           bold = TRUE, color = "#D95F02", background = "#FFF3E0")
+```
+
+Establishing universal thresholds to identify strategic defaulters is inherently challenging, as criteria often shift with market conditions. Nevertheless, the existence of such borrowers is empirically verifiable within this dataset. For analytical purposes, a specific threshold was defined: a Debt-to-Income (DTI) of 40% or less, a credit score of 650 or higher, and a Combined Loan-to-Value (CLTV) of at least 75%. These criteria identified 99 potential strategic defaulters. Notably, this group exhibits a significantly lower median DTI (33%) and a higher median CLTV (80%) compared to general Cash-Out defaulters. These findings provide clear evidence that these individuals possess sufficient financial liquidity to meet their obligations but choose to enter default intentionally. In this context, the decision to default represents an economically rational choice to mitigate capital loss rather than a consequence of genuine financial distress.
+
+## 4. Implications
+
+The disparity between independent factor analysis and the multivariate model analysis highlights a critical truth that default risk never travels in isolation. While a single factor, such as a high credit score, is generally viewed as a reliable safety net, its protective power can be neutralized when coupled with other factors such as large loan sizes. For institutions like Fannie Mae, relying on simplified metrics is no longer sufficient. A holistic evaluation of the interplay between these identified key factors is essential to identifying truly high-risk cases. The analysis reveals two significant paradoxes. First, higher interest rates and longer loan terms were associated with lower default risk, suggesting that the financial system's vetting process functions effectively, while extended terms reduce monthly debt service obligations. In this context, lenders likely apply more rigorous scrutiny to high-rate loan approvals to ensure borrower resilience, while the increased financial flexibility afforded by longer loan terms provides a buffer. Second, higher Combined Loan-to-Value (CLTV) was found to reduce risk. It is inferred that the outcome stems from financially sophisticated borrowers who utilize high leverage as a strategic tool to invest in premium properties prioritizing asset preservation over default. Another critical finding is the increased risk associated with joint applications. While having two borrowers might intuitively suggest income stability, the holistic analysis reveals a significant increase in default risk compared to single applications. This suggests that joint loans may render a household twice as sensitive to economic shocks, providing that double income does not necessarily mean double safety, especially when coupled with a higher aggregate debt burden. Ultimately, setting aside the aforementioned CLTV paradox, the most powerful deterrent that institutions can leverage is the availability of loan modifications. When borrowers are provided with a path to renegotiation, default risk can be significantly mitigated. Therefore, lenders should pivot from purely 'predictive' models to 'proactive' strategies, utilizing these insights to identify at-risk borrowers early and offering timely modification as a strategic safety net. These proactive strategies should include monitoring fluctuations in property equity, as such declines erode borrower equity and can stimulate default. Regarding strategic defaulters, while establishing a universal definition remains challenging, closer monitoring is required for Cash-Out borrowers. Given their unique incentive structure, having already realized immediate liquidity, they are economically more inclined to default strategically to mitigate further asset losses compared to other borrower types. Therefore, targeted intervention for this segment is essential to maintaining overall portfolio stability.
+
+## 5. Conclusion
+
+Default is often a rational decision, rather than merely a failure of ability to pay. This analysis concludes that mortgage default, often a 'cold goodbye', is a multifaceted decision driven by both financial distress and strategic economic calculation. The holistic findings highlight that higher credit scores, multiple borrowers (particularly in two borrower cases) and larger loan sizes are significant drivers of default risk. In contrast, loan modification serves as an effective structural safety net, and higher interest rates, longer loan terms and Combined Loan-to-Value (CLTV) significantly reduce default risk. A critical takeaway is the empirical identification of strategic defaulters within the Cash-Out segment. Unlike other borrower types, these individuals often possess the liquidity to maintain payments but choose to exit when the incentive for equity preservation vanishes. Therefore, it is essential to implement targeted monitoring for Cash-Out borrowers and expand access to modification options to preemptively mitigate default risks. While this analysis provides empirical evidence, capturing the full behavioral nuances of defaulters remains a challenge. Due to the absence of direct behavior data, the specific psychological triggers behind their decisions, such as why eligible borrowers fail to seek loan modifications, remain inferred. Future research should integrate qualitative insights to uncover these underlying motivations. Furthermore, incorporating missing data for previously excluded factors would significantly enrich the predictive depth of future risk analyses.
