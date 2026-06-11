@@ -2,7 +2,7 @@
 - Holistic Mortgage Default Risk Analysis: Uncovering Strategic Defaulters & Risk Paradoxes
 
 📖 Project Summary
-This project analyzes 420,436 Fannie Mae mortgage records to identify key drivers of default risk and empirically validate the phenomenon of "Strategic Default"—where affluent borrowers intentionally walk away from their loans as a calculated business decision. By implementing a rigorous data engineering pipeline and multivariate modeling, this study uncovers critical risk paradoxes and provides proactive mitigation strategies for institutional lenders.
+- This project analyzes 420,436 Fannie Mae mortgage records to identify key drivers of default risk and empirically validate the phenomenon of "Strategic Default"—where affluent borrowers intentionally walk away from their loans as a calculated business decision. By implementing a rigorous data engineering pipeline and multivariate modeling, this study uncovers critical risk paradoxes and provides proactive mitigation strategies for institutional lenders.
 
 🛠️ Data Engineering & Preprocessing
 - Feature Pruning: Removed 38 out of 75 factors that were more than 50% empty to ensure data quality.
