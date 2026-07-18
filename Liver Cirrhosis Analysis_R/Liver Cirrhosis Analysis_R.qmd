@@ -1,0 +1,718 @@
+---
+title: "STAT8150 Ass2"
+format: pdf
+editor: visual
+---
+
+## Library Import
+
+```{r}
+#| include: false
+library(car)
+library(rjags)
+library(ggplot2)
+library(dplyr)
+#install.packages('ggthemes')
+library(ggthemes)
+library(tidyr)
+library(patchwork)
+library(gridExtra)
+library(knitr)
+library(coda)
+```
+
+## Data Import
+
+```{r}
+liver_data <- read.csv("cirrhosis.csv")
+dim(liver_data)
+```
+
+## Data Cleaning
+
+```{r}
+#| include: false
+# Check missing data
+missing_counts <- colSums(is.na(liver_data))
+print(missing_counts)
+```
+
+```{r}
+#| echo: false
+# Remove six rows with missing data of stage 
+liver_data <- liver_data[!is.na(liver_data$Stage), ]
+# Map death status 
+liver_data$Death <- ifelse(liver_data$Status == "D", 1, 0)
+```
+
+```{r}
+#| echo: false
+# Check the filtering outcome
+dim(liver_data)
+```
+
+```{r}
+#| echo: false
+# Convert the type of stage
+liver_data$Stage <- as.numeric(liver_data$Stage)
+```
+
+```{r}
+#| echo: false
+# Convert age (days -> years)
+liver_data$Age_years <- liver_data$Age / 365.25
+```
+
+```{r}
+#| echo: false
+# Convert some variables into dummy variables 
+# Gender
+liver_data$Sex_num <- ifelse(liver_data$Sex == "F", 1, 0)
+# Abnormalities 
+liver_data$Ascites_num <- ifelse(liver_data$Ascites == "Y", 1, 0)
+liver_data$Hepato_num  <- ifelse(liver_data$Hepatomegaly == "Y", 1, 0)
+liver_data$Spiders_num <- ifelse(liver_data$Spiders == "Y", 1, 0)
+# Edema (in order)
+liver_data$Edema_num <- ifelse(liver_data$Edema == "N", 0, 
+                               ifelse(liver_data$Edema == "S", 1, 2))
+```
+
+```{r}
+#| echo: false
+# Convert Stage type into ordered factor (1 < 2 < 3 < 4)
+liver_data$Stage <- factor(liver_data$Stage, 
+                           levels = c(1, 2, 3, 4), 
+                           ordered = TRUE)
+
+class(liver_data$Stage)
+is.ordered(liver_data$Stage)
+```
+
+## Research Question 1
+
+Are the four selected clinical biomarkers statistically significant in predicting sequential cirrhosis stages?
+
+```{r}
+# Calculate Spearman's rank correlation for ordinal/continuous variables
+# against a target variable 
+get_spearman_cor_fixed <- function(data, target, predictors) {
+  results <- data.frame(Variable = character(), 
+                        Correlation = numeric(), 
+                        p_value = numeric(), 
+                        stringsAsFactors = FALSE)
+  
+  for (var in predictors) {
+    test <- cor.test(as.numeric(data[[target]]), as.numeric(data[[var]]), 
+                     method = "spearman", 
+                     use = "pairwise.complete.obs",
+                     exact = FALSE)
+    
+    results <- rbind(results, data.frame(Variable = var, 
+                                          Correlation = as.numeric(test$estimate), 
+                                          p_value = as.numeric(test$p.value)))
+  }
+  return(results)
+}
+```
+
+```{r}
+#| include: false
+exclude_list <- c("Stage", "Status", "Death", "N_Days", "ID", 
+                  "Sex", "Sex_num", "Drug", "Ascites", "Ascites_num", 
+                  "Hepatomegaly", "Hepato_num", "Spiders", "Spiders_num", 
+                  "Edema", "Edema_num")
+
+continuous_vars <- setdiff(colnames(liver_data), exclude_list)
+
+print(continuous_vars)
+```
+
+```{r}
+#| echo: false
+spearman_res <- get_spearman_cor_fixed(liver_data, "Stage", continuous_vars)
+spearman_res$AbsCorr <- abs(spearman_res$Correlation)
+top_5_spearman <- spearman_res[spearman_res$p_value < 0.05, ]
+top_5_spearman <- 
+  top_5_spearman[order(top_5_spearman$AbsCorr, decreasing = TRUE), ][1:5, ]
+
+selected_features <- top_5_spearman$Variable
+
+print("--- [1. Spearman Top 5 Features] ---")
+print(top_5_spearman[, c("Variable", "Correlation", "p_value")])
+
+# Conduct multicollinearity diagnostic (VIF)
+vif_formula <- as.formula(paste("as.numeric(Stage) ~", 
+                                paste(selected_features, collapse = "+")))
+vif_model <- lm(vif_formula, data = liver_data)
+
+vif_values <- vif(vif_model)
+
+print("--- [2. Multicollinearity Check (VIF)] ---")
+print(vif_values)
+
+max_vif <- max(vif_values)
+cat("\n Results: ")
+if(max_vif < 5) {
+  cat("All VIF values are below 5. Multicollinearity is minimal, and all 5 variables are suitable for inclusion in the model.\n")
+} else if(max_vif < 10) {
+  cat("Some VIF values exceed 5. While caution is advised, they remain within an acceptable range for analysis.\n")
+} else {
+  cat("VIF values of 10 or higher detected! Significant multicollinearity is present, and variable refinement may be necessary.\n")
+}
+```
+
+```{r}
+jags_data <- list(
+  y = as.numeric(liver_data$Stage),
+  alb = as.numeric(scale(liver_data$Albumin)),
+  pro = as.numeric(scale(liver_data$Prothrombin)),
+  cop = as.numeric(scale(liver_data$Copper)),
+  pla = as.numeric(scale(liver_data$Platelets)),
+  N = nrow(liver_data)
+)
+
+# Define JAGS for an Ordered Probit Model
+model_def <- "
+model {
+  for (i in 1:N) {
+    
+    # Bayesian Automated Imputation via prior specification
+    alb[i] ~ dnorm(mu_alb, tau_alb)
+    pro[i] ~ dnorm(mu_pro, tau_pro)
+    cop[i] ~ dnorm(mu_cop, tau_cop)
+    pla[i] ~ dnorm(mu_pla, tau_pla)
+    
+    # mu[i] represents the mean of the latent severity probability distribution 
+    # for each patient  
+    mu[i] <- b_alb*alb[i] + b_pro*pro[i] + b_cop*cop[i] + b_pla*pla[i]
+    
+    # [Likelihood Part 1: Cumulative Probabilities]
+    # Compute the cumulative probabilities using cutpoints (c)  
+    # and individual latent severity (mu)
+    # Map each patient's linear predictor to the target via the phi function
+    p_cum[i, 1] <- phi(c[1] - mu[i]) # Probability of being in stage 1
+    p_cum[i, 2] <- phi(c[2] - mu[i]) # Probability of being in stage 1 or 2
+    p_cum[i, 3] <- phi(c[3] - mu[i]) # Probability of being in stage 1 or 2 or 3
+    
+    # [Likelihood Part 2: Individual Category Probabilities]
+    # Subtract cumulative probabilities to compute the discrete category 
+    # probabilities (pr) for each of the 4 ordinal stages
+    pr[i, 1] <- p_cum[i, 1]               # Probability of being in stage 1
+    pr[i, 2] <- p_cum[i, 2] - p_cum[i, 1] # Probability of being in stage 2
+    pr[i, 3] <- p_cum[i, 3] - p_cum[i, 2] # Probability of being in stage 3
+    pr[i, 4] <- 1 - p_cum[i, 3]           # Probability of being in stage 4
+    
+    # [Final Likelihood Evaluation] 
+    # Evaluate the observed ordinal stage (y[i]) for each patient 
+    # using the categorical distribution 
+    y[i] ~ dcat(pr[i, 1:4])
+  }
+
+  # Define priors for coefficients (Uninformative Prior)
+  b_alb ~ dnorm(0, 0.001)
+  b_pro ~ dnorm(0, 0.001)
+  b_cop ~ dnorm(0, 0.001)
+  b_pla ~ dnorm(0, 0.001)
+
+  # Define priors for cutpoints (Uninformative Priors with Ordinal Constraints)
+  c_raw[1] ~ dnorm(0, 0.001)
+  c_raw[2] ~ dnorm(0, 0.001)
+  c_raw[3] ~ dnorm(0, 0.001)
+  c[1:3] <- sort(c_raw)
+  
+  # Define hyperparameters for missing data imputation (Uninformative Priors)
+  mu_alb ~ dnorm(0, 0.001); tau_alb ~ dgamma(0.001, 0.001)
+  mu_pro ~ dnorm(0, 0.001); tau_pro ~ dgamma(0.001, 0.001)
+  mu_cop ~ dnorm(0, 0.001); tau_cop ~ dgamma(0.001, 0.001)
+  mu_pla ~ dnorm(0, 0.001); tau_pla ~ dgamma(0.001, 0.001)
+}
+"
+```
+
+```{r}
+# Configure MCMC setup and execute Bayesian sampling
+set.seed(48764388)
+
+RUN_JAGS <- TRUE
+
+if (RUN_JAGS) {
+
+  init_values <- list(
+      list(b_alb = 0, b_pro = 0, b_cop = 0, b_pla = 0, 
+          c_raw = c(-2.0, 0.0, 2.0), 
+          .RNG.name = "base::Wichmann-Hill", .RNG.seed = 123), # Chain 1
+      list(b_alb = -0.1, b_pro = 0.1, b_cop = 0.1, 
+          b_pla = -0.1, c_raw = c(-1.5, 0.5, 2.5), 
+          .RNG.name = "base::Wichmann-Hill", .RNG.seed = 124), # Chain 2
+      list(b_alb = 0.1, b_pro = -0.1, b_cop = -0.1, 
+          b_pla = 0.1, c_raw = c(-2.5, -0.5, 1.5),
+          .RNG.name = "base::Wichmann-Hill", .RNG.seed = 125) # Chain 3
+  )
+
+  jags_model <- jags.model(textConnection(model_def), 
+                          data = jags_data, 
+                          inits = init_values,  
+                          n.chains = 3,          
+                          n.adapt = 1000)        
+
+  update(jags_model, 2000)
+
+  # Check imputation outcomes together
+  samples <- coda.samples(jags_model, 
+                          variable.names = c("b_alb", "b_pro", 
+                                            "b_cop", "b_pla", "c",
+                                            "cop", "pla", "pro"), 
+                          n.iter = 5000)
+
+  saveRDS(samples, file = "jags_samples.rds")
+
+  } else {
+    if (file.exists("jags_samples.rds")) {
+      samples <- readRDS("jags_samples.rds")
+      message("Successfully read RDS file.")
+    } else {
+      stop("Error.")
+    }
+  }
+
+summary(samples)
+```
+
+```{r}
+# Check imputation outcome
+# [1] 413 (b_cop 1 + patients 412)
+all_names <- colnames(samples[[1]])
+length(all_names[grep("cop", all_names)])  
+length(all_names[grep("pla", all_names)])  
+length(all_names[grep("pro", all_names)])
+```
+
+```{r}
+any(is.na(as.matrix(samples)))
+```
+
+```{r}
+# Visuaize variable importance
+summary_quantiles <- as.data.frame(summary(samples)$quantiles)
+summary_stats     <- as.data.frame(summary(samples)$statistics)
+
+target_vars <- c("b_alb", "b_cop", "b_pla", "b_pro")
+display_names <- c("Albumin", "Copper", "Platelets", "Prothrombin Time")
+
+plot_data <- data.frame(
+  Variable = display_names,
+  Mean     = summary_stats[target_vars, "Mean"],
+  Lower    = summary_quantiles[target_vars, "2.5%"],
+  Upper    = summary_quantiles[target_vars, "97.5%"]
+)
+
+ggplot(plot_data, aes(x = Mean, y = reorder(Variable, abs(Mean)))) +
+  geom_vline(xintercept = 0, color = "red", linetype = "dashed", size = 0.8) +
+  geom_errorbarh(aes(xmin = Lower, xmax = Upper), height = 0.2, 
+                 color = "orange", size = 1) +
+  geom_point(size = 3, color = "black") +
+  labs(
+    title = "Variable Importance (95% Credible Intervals)",
+    x = "Estimated Coefficient Value",
+    y = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 12), 
+    axis.text.y = element_text(size = 10, face = "bold"),
+    axis.title = element_text(size = 10)
+  )
+```
+
+```{r}
+# Visuaize latent thresholds
+target_cuts <- c("c[1]", "c[2]", "c[3]")
+display_cuts <- c("Cutpoint 1 (Stage 1 | 2)", "Cutpoint 2 (Stage 2 | 3)", "Cutpoint 3 (Stage 3 | 4)")
+
+plot_cuts <- data.frame(
+  Variable = display_cuts,
+  Mean     = summary_stats[target_cuts, "Mean"],
+  Lower    = summary_quantiles[target_cuts, "2.5%"],
+  Upper    = summary_quantiles[target_cuts, "97.5%"]
+)
+
+ggplot(plot_cuts, aes(x = Mean, y = Variable)) +
+  geom_errorbarh(aes(xmin = Lower, xmax = Upper), height = 0.2, 
+                 color = "orange", size = 1) +  
+  geom_vline(xintercept = 0, color = "red", linetype = "dashed", size = 0.8) +
+  geom_point(size = 3, color = "black") +
+  labs(
+    title = "Latent Thresholds (95% Credible Intervals)",
+    x = "Latent Severity Scale",
+    y = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 12), 
+    axis.text.y = element_text(size = 10, face = "bold"),
+    axis.title = element_text(size = 10)
+  )
+```
+
+```{r}
+#| echo: false
+# Draw trace plots
+plot(samples[, c("b_alb", "b_cop")])
+plot(samples[, c("b_pla", "b_pro")])
+plot(samples[, c("c[1]", "c[2]", "c[3]")])
+```
+
+```{r}
+# Check R_hat and ESS
+r_hat_raw <- gelman.diag(samples, multivariate = FALSE)$psrf
+r_hat_df  <- as.data.frame(r_hat_raw)
+
+ess_raw <- effectiveSize(samples)
+ess_df  <- as.data.frame(ess_raw)
+
+convergence_table <- data.frame(
+  Variable = rownames(r_hat_df),
+  R_hat    = round(r_hat_df$`Point est.`, 3),    
+  ESS      = round(ess_df$ess_raw, 0)             
+)
+
+print(convergence_table)
+```
+
+According to the Bayesian ordered probit analysis, Albumin, Platelets, Copper, and Prothrombin Time were identified as significant predictors for the histological stages of cirrhosis. Albumin and Platelets exhibit a negative correlation with cirrhosis progression, indicating that a decrease in these biomarkers reflects deteriorating liver function. In contrast, increased levels of Copper and Prothrombin time are associated with advanced cirrhosis stages. While Bilirubin was significant in univariate analysis, it did not show a statistically significant impact in this multivariate model, as its 95% credible interval included zero.
+
+## Research Question 2
+
+What is the most influential blood biomarker for each distinct stage transition?
+
+```{r}
+# Identify 
+
+mcmc_summary <- summary(samples)
+means_matrix <- mcmc_summary$statistics 
+quantiles_matrix <- mcmc_summary$quantiles  
+
+betas <- c(
+  Alb = means_matrix["b_alb", "Mean"],
+  Cop = means_matrix["b_cop", "Mean"],
+  Pla = means_matrix["b_pla", "Mean"],
+  Pro = means_matrix["b_pro", "Mean"]
+)
+
+raw_data <- data.frame(
+  alb   = as.vector(jags_data$alb),
+  cop   = as.vector(jags_data$cop),
+  pla   = as.vector(jags_data$pla),
+  pro   = as.vector(jags_data$pro),
+  stage = as.vector(jags_data$y) 
+)
+
+if (nrow(raw_data) == 0) {
+  stop("Error")
+}
+
+mean_stage1 <- colMeans(raw_data[raw_data$stage == 1, 
+                                 c("alb", "cop", "pla", "pro")], na.rm = TRUE)
+mean_stage2 <- colMeans(raw_data[raw_data$stage == 2, 
+                                 c("alb", "cop", "pla", "pro")], na.rm = TRUE)
+mean_stage3 <- colMeans(raw_data[raw_data$stage == 3, 
+                                 c("alb", "cop", "pla", "pro")], na.rm = TRUE)
+names(mean_stage1) <- c("Alb", "Cop", "Pla", "Pro")
+names(mean_stage2) <- c("Alb", "Cop", "Pla", "Pro")
+names(mean_stage3) <- c("Alb", "Cop", "Pla", "Pro")
+
+calc_stage_share <- function(beta_vec, mean_vec) {
+  real_effect <- abs(beta_vec * mean_vec) 
+  standardized_shares <- (real_effect / sum(real_effect)) * 100
+  return(standardized_shares)
+}
+
+share_trans1 <- calc_stage_share(betas, mean_stage1) # Stage 1 -> 2
+share_trans2 <- calc_stage_share(betas, mean_stage2) # Stage 2 -> 3
+share_trans3 <- calc_stage_share(betas, mean_stage3) # Stage 3 -> 4
+
+get_rankings <- function(share_vector) {
+  sorted_shares <- sort(share_vector, decreasing = TRUE)
+  return(list(
+    Top = paste(names(sorted_shares)[1], " (", round(sorted_shares[1], 1), "%)", sep=""),
+    Runner = paste(names(sorted_shares)[2], " (", round(sorted_shares[2], 1), "%)", sep="")
+  ))
+}
+
+r1 <- get_rankings(share_trans1)
+r2 <- get_rankings(share_trans2)
+r3 <- get_rankings(share_trans3)
+
+df_real_dominance <- data.frame(
+  Transition = c("Stage 1 -> 2 (Early)", "Stage 2 -> 3 (Progression)", 
+                 "Stage 3 -> 4 (Severe)"),
+  Most_Influential_Biomarker = c(r1$Top, r2$Top, r3$Top),
+  Runner_Up = c(r1$Runner, r2$Runner, r3$Runner)
+)
+
+print("====================================================================")
+print("Mathematical Verification: Dynamic Driver for Each Stage Transition")
+print("====================================================================")
+print(df_real_dominance)
+```
+
+```{r}
+df_plot_shares <- data.frame(
+  Transition = rep(c("Stage 1 → 2\n(Early)", 
+                     "Stage 2 → 3\n(Progression)", 
+                     "Stage 3 → 4\n(Severe)"), each = 4),
+  Biomarker = rep(c("Albumin", "Copper", 
+                    "Platelets", "Prothrombin Time"), times = 3),
+  Share = c(
+    share_trans1["Alb"], 
+    share_trans1["Cop"], 
+    share_trans1["Pla"], 
+    share_trans1["Pro"],
+    share_trans2["Alb"], 
+    share_trans2["Cop"], 
+    share_trans2["Pla"], 
+    share_trans2["Pro"],
+    share_trans3["Alb"], 
+    share_trans3["Cop"], 
+    share_trans3["Pla"], 
+    share_trans3["Pro"]
+  )
+)
+
+df_plot_shares$Transition <- factor(df_plot_shares$Transition, levels = c(
+  "Stage 1 → 2\n(Early)", "Stage 2 → 3\n(Progression)", "Stage 3 → 4\n(Severe)"
+))
+
+ggplot(df_plot_shares, aes(x = Transition, y = Share, fill = Biomarker)) +
+  geom_bar(stat = "identity", 
+           position = position_dodge(width = 0.85), 
+           width = 0.75) +
+  geom_text(aes(label = paste0(round(Share, 1), "%")), 
+            position = position_dodge(width = 0.85), 
+            vjust = -0.5, size = 2.5, fontface = "bold") +
+  
+  scale_fill_manual(values = c(
+    "Albumin" = "#005088",  
+    "Copper" = "#e67e22",   
+    "Prothrombin Time" = "#d9534f",  
+    "Platelets" = "#94a3b8"   
+  )) +
+  labs(
+    title = "Blood Biomarker Drivers Across Disease Transitions",
+    x = "Cirrhosis Stage Transitions",
+    y = "Relative Contribution Share (%)",
+    fill = "Biomarkers"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 12),
+    axis.text = element_text(size = 9, face = "bold"),
+    axis.title = element_text(size = 10),
+    legend.position = "top",
+    legend.title = element_text(face = "bold"),
+    panel.grid.major.x = element_blank() 
+  ) +
+  ylim(0, max(df_plot_shares$Share) + 8)
+```
+
+Albumin is the most influential driver during the early (stage 1 to 2) and severe (stage 3 to 4) transitions, accounting for 40.3% and 46.1% of the relative contribution share, respectively. In contrast, during the intermediate progression stage (stage 2 to 3), Copper emerges as the dominant driver at 34.1%. Given that Albumin’s influence becomes prominent in the critical severe stage, strict clinical management must focus on maintaining adequate Albumin levels to prevent terminal deterioration.
+
+## Research Question 3
+
+How do clinical changes in blood biomarkers affect stage 4 probability?
+
+```{r}
+mcmc_stats <- summary(samples)$statistics
+
+betas <- c(
+  Alb = mcmc_stats["b_alb", "Mean"],
+  Cop = mcmc_stats["b_cop", "Mean"],
+  Pla = mcmc_stats["b_pla", "Mean"],
+  Pro = mcmc_stats["b_pro", "Mean"]
+)
+
+c_cuts <- c(
+  mcmc_stats["c[1]", "Mean"],
+  mcmc_stats["c[2]", "Mean"],
+  mcmc_stats["c[3]", "Mean"]
+)
+
+meta_units <- list(
+  Alb = list(
+    mean = mean(liver_data$Albumin, na.rm = TRUE),  
+    sd   = sd(liver_data$Albumin, na.rm = TRUE),  
+    name = "Albumin (g/dL)"
+  ),
+  Cop = list(
+    mean = mean(liver_data$Copper, na.rm = TRUE),  
+    sd   = sd(liver_data$Copper, na.rm = TRUE),  
+    name = "Copper (µg/dL)"
+  ),
+  Pla = list(
+    mean = mean(liver_data$Platelets, na.rm = TRUE), 
+    sd   = sd(liver_data$Platelets, na.rm = TRUE),  
+    name = "Platelets (×10³/µL)"
+  ),
+  Pro = list(
+    mean = mean(liver_data$Prothrombin, na.rm = TRUE), 
+    sd   = sd(liver_data$Prothrombin, na.rm = TRUE),  
+    name = "Prothrombin Time (seconds)"
+  )
+)
+
+plot_biomarker_real_scale <- function(var_key, coef_value, title_name) {
+  
+  std_range <- seq(-3, 3, length.out = 100)
+  
+  probs <- sapply(std_range, function(x) {
+    mu <- coef_value * x  
+    
+    p1 <- pnorm(c_cuts[1] - mu)
+    p2 <- pnorm(c_cuts[2] - mu) - pnorm(c_cuts[1] - mu)
+    p3 <- pnorm(c_cuts[3] - mu) - pnorm(c_cuts[2] - mu)
+    p4 <- 1 - pnorm(c_cuts[3] - mu)
+    
+    return(c(p1, p2, p3, p4))
+  })
+  
+  var_meta <- meta_units[[var_key]]
+  real_range <- (std_range * var_meta$sd) + var_meta$mean
+  
+  df_plot <- data.frame(
+    Value = real_range, 
+    `Stage 1` = probs[1,], 
+    `Stage 2` = probs[2,], 
+    `Stage 3` = probs[3,], 
+    `Stage 4` = probs[4,],
+    check.names = FALSE 
+  )
+  
+  df_long <- gather(df_plot, key = "Stage", value = "Probability", -Value)
+  df_long$Stage <- factor(df_long$Stage, 
+                          levels = c("Stage 1", "Stage 2", "Stage 3", "Stage 4"))
+  
+  p <- ggplot(df_long, aes(x = Value, y = Probability, color = Stage)) +
+    geom_line(size = 1.2) +
+    labs(title = title_name, x = var_meta$name, y = "Probability") +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 10),
+      axis.title = element_text(size = 10)
+    )
+  return(p)
+}
+
+
+p_alb <- plot_biomarker_real_scale("Alb", betas["Alb"], "Albumin (Protective)")
+p_cop <- plot_biomarker_real_scale("Cop", betas["Cop"], "Copper (Risk)")
+p_pla <- plot_biomarker_real_scale("Pla", betas["Pla"], "Platelets (Protective)")
+p_pro <- plot_biomarker_real_scale("Pro", betas["Pro"], "Prothrombin Time (Risk)")
+
+combined_plot <- wrap_plots(p_alb, p_cop, p_pla, p_pro, ncol = 2) + 
+  plot_layout(guides = 'collect') + 
+  plot_annotation(
+    title = "Effect of Blood Biomarkers on Cirrhosis Stage Probabilities (Clinical Units)",
+    theme = theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 12),
+      legend.title = element_text(face = "bold")
+    )
+  )
+
+print(combined_plot)
+```
+
+```{r}
+sd_alb <- sd(liver_data$Albumin, na.rm = TRUE)
+sd_cop <- sd(liver_data$Copper, na.rm = TRUE)
+sd_pla <- sd(liver_data$Platelets, na.rm = TRUE)
+sd_pro <- sd(liver_data$Prothrombin, na.rm = TRUE)
+
+cat("Albumin 1 unit =", round(sd_alb, 2), "g/dL\n")
+cat("Copper 1 unit =", round(sd_cop, 2), "ug/dL\n")
+cat("Platelets 1 unit =", round(sd_pla, 2), "x 10^3/uL\n")
+cat("Prothrombin Time 1 unit =", round(sd_pro, 2), "seconds\n")
+```
+
+These four plots illustrate the influence of key blood biomarkers on cirrhosis stage probabilities. Specifically, a one-unit shift in the underlying standardized scale corresponds to a clinical change of $0.42 \text{g/dL}$ for Albumin, $85.61 \mu\text{g/dL}$ for Copper, $95.75 \times 10^3/\mu\text{L}$ for Platelets, and $1.03 \text{ seconds}$ for Prothrombin Time. Notably, stage 4 probability exhibits the most sharp, non-linear progression, suggesting the existence of critical clinical trigger points. The parabolic trend lines of stage 3 intersect with the stage 4 curves at specific thresholds, capturing distinct stage transitions. For example, a Copper level exceeding 150 and a Prothrombin Time rising above 12.5 serve as strong indicators of a transition into stage 4. Conversely, when Albumin drops below 3.3 or Platelets fall below 200, the probability of stage 4 overtakes stage 3, serving as a critical warning sign of transition into the terminal stage.
+
+## Research Question 4
+
+How accurately can the Bayesian Ordered Probit model predict patients in stage 3 and 4?
+
+```{r}
+jags_summary <- summary(samples)$statistics
+
+b_alb <- jags_summary["b_alb", "Mean"]
+b_cop <- jags_summary["b_cop", "Mean"]
+b_pla <- jags_summary["b_pla", "Mean"]
+b_pro <- jags_summary["b_pro", "Mean"]
+
+b <- c(b_alb, b_cop, b_pla, b_pro)
+c_vals <- jags_summary[c("c[1]", "c[2]", "c[3]"), "Mean"]
+
+scale_alb <- as.numeric(scale(liver_data$Albumin))
+scale_cop <- as.numeric(scale(liver_data$Copper))
+scale_pla <- as.numeric(scale(liver_data$Platelets))
+scale_pro <- as.numeric(scale(liver_data$Prothrombin))
+
+scale_cop[is.na(scale_cop)] <- 0
+
+scale_pla[is.na(scale_pla)] <- 0
+scale_pro[is.na(scale_pro)] <- 0
+
+mat_X_perfect <- cbind(scale_alb, scale_cop, scale_pla, scale_pro)
+
+mu_pred <- mat_X_perfect %*% b
+
+N <- nrow(liver_data)
+predicted_stage <- integer(N)
+
+for (i in 1:N) {
+  p_cum1 <- pnorm(c_vals[1] - mu_pred[i])
+  p_cum2 <- pnorm(c_vals[2] - mu_pred[i])
+  p_cum3 <- pnorm(c_vals[3] - mu_pred[i])
+  
+  pr1 <- p_cum1
+  pr2 <- p_cum2 - p_cum1
+  pr3 <- p_cum3 - p_cum2
+  pr4 <- 1 - p_cum3
+  
+  prob_vector <- c(pr1, pr2, pr3, pr4)
+  prob_vector[prob_vector < 0] <- 0  
+  
+  if (all(prob_vector == 0)) {
+    if (mu_pred[i] > 0) { predicted_stage[i] <- 4 } else { predicted_stage[i] <- 1 }
+  } else {
+    predicted_stage[i] <- which.max(prob_vector)  
+  }
+}
+
+eval_data <- data.frame(
+  Actual = factor(as.numeric(liver_data$Stage), levels = 1:4, 
+                  labels = paste("Stage", 1:4)),
+  Predicted = factor(predicted_stage, levels = 1:4, labels = paste("Stage", 1:4))
+)
+
+conf_matrix <- table(Actual = eval_data$Actual, Predicted = eval_data$Predicted)
+accuracy <- sum(diag(conf_matrix)) / sum(conf_matrix)
+
+print("=== Confusion Matrix ===")
+print(conf_matrix)
+cat("\n=== Accuarcy ==:\n", round(accuracy * 100, 2), "%\n")
+
+cm_df <- as.data.frame(conf_matrix)
+
+ggplot(cm_df, aes(x = Predicted, y = Actual, fill = Freq)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(low = "#f7fbff", high = "#08306b") +
+  geom_text(aes(label = Freq), fontface = "bold", size = 5) + 
+  labs(title = paste("Final Bayesian Confusion Matrix (Accuracy:", 
+                     round(accuracy * 100, 1), "%)"),
+       x = "Predicted Stage (Model)",
+       y = "Actual Stage (True)") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 14), 
+        axis.title = element_text(face = "bold"))
+```
+
+This model serves as a high-safety screening tool. As demonstrated in the final Bayesian confusion matrix, the model achieved 0 cases of critical under-diagnosis, where advanced patients (stage 3 and 4) were never misclassified into stage 1. The overall accuracy of 48.5% reflects the model's preference for cautious over-diagnosis rather than risking fatal under-diagnosis. Notably, the model demonstrates moderate predictive power for advanced conditions, achieving a sensitivity of approximately 68% (106/155) for stage 3 and 56% (81/144) for stage 4. Furthermore, the performance implies that the four standard biomarkers (Albumin, Platelets, Copper and Prothrombin Time) alone are not sufficient to capture individual biological baselines. Lastly, due to the characteristics of the target variables, their boundaries are naturally overlapping, leading to frequent misclassification into adjacent categories (e.g., stage 4 being misclassified as stage 3).
