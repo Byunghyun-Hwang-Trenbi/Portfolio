@@ -18,7 +18,9 @@ Data Scientist & Engineer bridging the gap between raw data and business growth.
 3. Heart Attack Risk Prediction & Statistical Rigor
 - A high-integrity analysis project emphasizing rigorous statistical validation (Shapiro-Wilk, Mann-Whitney U tests).
 4. Liver Cirrhosis Analysis
-- Developed a Bayesian Ordered Probit model in JAGS to identify critical biomarker tipping points (e.g., Albumin $< 3.3$ g/dL) and achieved a 0% false-negative rate for advanced-stage patient screening.  
+- Developed a Bayesian Ordered Probit model in JAGS to identify critical biomarker tipping points (e.g., Albumin $< 3.3$ g/dL) and achieved a 0% false-negative rate for advanced-stage patient screening.
+5. Credit Default Analysis & Classification
+- Built a data engineering pipeline on 420K+ Fannie Mae records and leveraged multivariate modeling to empirically validate "Strategic Default" behaviors and uncover risk paradoxes for institutional lenders.
 
 ### 🖥️ Algorithms & Optimization
 1. Nearest Neighbor Search: R-Tree Optimization
