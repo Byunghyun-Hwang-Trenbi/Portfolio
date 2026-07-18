@@ -17,6 +17,8 @@ Data Scientist & Engineer bridging the gap between raw data and business growth.
 - Applied Regression Modeling & Hypothesis Testing in R to uncover economic drivers of gratuity patterns.
 3. Heart Attack Risk Prediction & Statistical Rigor
 - A high-integrity analysis project emphasizing rigorous statistical validation (Shapiro-Wilk, Mann-Whitney U tests).
+4. Liver Cirrhosis Analysis
+- Developed a Bayesian Ordered Probit model in JAGS to identify critical biomarker tipping points (e.g., Albumin $< 3.3$ g/dL) and achieved a 0% false-negative rate for advanced-stage patient screening.  
 
 ### 🖥️ Algorithms & Optimization
 1. Nearest Neighbor Search: R-Tree Optimization
