@@ -1,6 +1,6 @@
 ---
 title: "A Cold Goodbye: The Strategic Calculation of Mortgage Default"
-author: "Byunghyun_Hwang 48764388"
+author: "Byunghyun_Hwang"
 format: 
   pdf:
     prefer-html: true
